@@ -97,6 +97,7 @@ extern crate itertools_num;
 #[macro_use]
 extern crate lazy_static;
 extern crate multimap;
+#[macro_use]
 extern crate ndarray;
 #[macro_use]
 extern crate newtype_derive;
