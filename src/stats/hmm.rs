@@ -161,6 +161,35 @@ impl HMM {
 
         (result, res_prob)
     }
+
+    // Compute the probability of a series of observations using the forward algorithm.
+    pub fn forward(&self, observations: Vec<usize>) -> LogProb {
+        // The matrix with probabilities.
+        let mut vals = Array2::<LogProb>::zeros((observations.len(), self.num_states()));
+
+        // Compute matrix.
+        for (i, o) in observations.iter().enumerate() {
+            if i == 0 {
+                // Initial column.
+                for (j, p) in self.initial.iter().enumerate() {
+                    vals[[0, j]] = p + self.observation[[j, *o]];
+                }
+            } else {
+                // Subsequent columns.
+                for j in 0..self.num_states() {
+                    let xs = (0..self.num_states())
+                        .map(|k| {
+                            vals[[i - 1, k]] + self.transition[[k, j]] + self.observation[[j, *o]]
+                        })
+                        .collect::<Vec<LogProb>>();
+                    vals[[i, j]] = LogProb::ln_sum_exp(&xs);
+                }
+            }
+        }
+
+        // Compute final probability.
+        LogProb::ln_sum_exp(vals.row(observations.len() - 1).into_slice().unwrap())
+    }
 }
 
 #[cfg(test)]
@@ -168,7 +197,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_toy_sample() {
+    fn test_viterbi_toy_example() {
         // We construct the toy example from Borodovsky & Ekisheva (2006), pp. 80.
         //
         // http://cecas.clemson.edu/~ahoover/ece854/refs/Gonze-ViterbiAlgorithm.pdf
@@ -185,6 +214,21 @@ mod tests {
         let prob = Prob::from(log_prob);
 
         assert_eq!(vec![0, 0, 0, 1, 1, 1, 1, 1, 1], path);
-        assert_relative_eq!(4.25e-8_f64, *prob, epsilon = 1e-9_f64)
+        assert_relative_eq!(4.25e-8_f64, *prob, epsilon = 1e-9_f64);
+    }
+
+    #[test]
+    fn test_forward_toy_example() {
+        // Same toy example as above.
+        let transition = array![[0.5, 0.5], [0.4, 0.6]];
+        let observation = array![[0.2, 0.3, 0.3, 0.2], [0.3, 0.2, 0.2, 0.3]];
+        let initial = array![0.5, 0.5];
+
+        let hmm = HMM::with_float(&transition, &observation, &initial)
+            .expect("Dimensions should be consistent");
+        let log_prob = hmm.forward(vec![2, 2, 1, 0]);
+        let prob = Prob::from(log_prob);
+
+        assert_relative_eq!(0.0038432_f64, *prob, epsilon = 0.0001);
     }
 }
