@@ -112,7 +112,6 @@ impl HMM {
                     from[[0, j]] = j;
                 }
             } else {
-                // TODO: need to store pointers back...
                 // Subsequent columns.
                 for j in 0..self.num_states() {
                     let x = vals.subview(Axis(0), i - 1)
@@ -190,6 +189,43 @@ impl HMM {
         // Compute final probability.
         LogProb::ln_sum_exp(vals.row(observations.len() - 1).into_slice().unwrap())
     }
+
+    // Compute the probability of a series of observations using the backward algorithm.
+    pub fn backward(&self, observations: Vec<usize>) -> LogProb {
+        // The matrix with probabilities.
+        let mut vals = Array2::<LogProb>::zeros((observations.len(), self.num_states()));
+
+        // Compute matrix.
+        for (i, o) in observations.iter().rev().enumerate() {
+            if i == 0 {
+                // Initial (last) column.
+                for j in 0..self.num_states() {
+                    vals[[0, j]] = LogProb::ln_one() + self.observation[[j, *o]];
+                }
+            } else {
+                // Previous columns.
+                for j in 0..self.num_states() {
+                    let maybe_initial = if j == self.num_states() - 1 {
+                        self.initial[[j]]
+                    } else {
+                        LogProb::ln_one()
+                    };
+                    let xs = (0..self.num_states())
+                        .map(|k| {
+                            vals[[i - 1, k]]
+                                + self.transition[[j, k]]
+                                + self.observation[[j, *o]]
+                                + maybe_initial
+                        })
+                        .collect::<Vec<LogProb>>();
+                    vals[[i, j]] = LogProb::ln_sum_exp(&xs);
+                }
+            }
+        }
+
+        // Compute final probability.
+        LogProb::ln_sum_exp(vals.row(observations.len() - 1).into_slice().unwrap())
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +263,21 @@ mod tests {
         let hmm = HMM::with_float(&transition, &observation, &initial)
             .expect("Dimensions should be consistent");
         let log_prob = hmm.forward(vec![2, 2, 1, 0]);
+        let prob = Prob::from(log_prob);
+
+        assert_relative_eq!(0.0038432_f64, *prob, epsilon = 0.0001);
+    }
+
+    #[test]
+    fn test_backward_toy_example() {
+        // Same toy example as above.
+        let transition = array![[0.5, 0.5], [0.4, 0.6]];
+        let observation = array![[0.2, 0.3, 0.3, 0.2], [0.3, 0.2, 0.2, 0.3]];
+        let initial = array![0.5, 0.5];
+
+        let hmm = HMM::with_float(&transition, &observation, &initial)
+            .expect("Dimensions should be consistent");
+        let log_prob = hmm.backward(vec![2, 2, 1, 0]);
         let prob = Prob::from(log_prob);
 
         assert_relative_eq!(0.0038432_f64, *prob, epsilon = 0.0001);
