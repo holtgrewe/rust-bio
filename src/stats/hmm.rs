@@ -30,7 +30,7 @@ pub struct HMM {
     transition: Array2<LogProb>,
     /// The observation symbol probability distribution (size `NxM`), `B` in Rabiner's tutorial.
     observation: Array2<LogProb>,
-    /// The initial state distribution (size `M`), `pi` in Rabiner's tutorial.
+    /// The initial state distribution (size `N`), `pi` in Rabiner's tutorial.
     initial: Array1<LogProb>,
 }
 
@@ -95,6 +95,11 @@ impl HMM {
         self.transition.dim().0
     }
 
+    /// Return observation probabilitiy.
+    fn observation_prob(&self, state: usize, symbol: usize) -> LogProb {
+        return self.observation[[state, symbol]];
+    }
+
     /// Compute most likely sequence of states given a list of observations using the Viterbi
     /// algorithm (maximum a posteriori/MAP).
     pub fn viterbi(&self, observations: Vec<usize>) -> (Vec<usize>, LogProb) {
@@ -108,7 +113,213 @@ impl HMM {
             if i == 0 {
                 // Initial column.
                 for (j, p) in self.initial.iter().enumerate() {
-                    vals[[0, j]] = p + self.observation[[j, *o]];
+                    vals[[0, j]] = p + self.observation_prob(j, *o);
+                    from[[0, j]] = j;
+                }
+            } else {
+                // Subsequent columns.
+                for j in 0..self.num_states() {
+                    let x = vals.subview(Axis(0), i - 1)
+                        .iter()
+                        .enumerate()
+                        .max_by(|(a, x), (b, y)| {
+                            if x.is_zero() && y.is_zero() {
+                                Ordering::Equal
+                            } else if x.is_zero() {
+                                Ordering::Less
+                            } else if y.is_zero() {
+                                Ordering::Greater
+                            } else {
+                                (*x + self.transition[[*a, j]])
+                                    .partial_cmp(&(*y + self.transition[[*b, j]]))
+                                    .unwrap()
+                            }
+                        })
+                        .map(|(x, y)| (x, *y))
+                        .unwrap();
+                    vals[[i, j]] = x.1 + self.transition[[x.0, j]] + self.observation_prob(j, *o);
+                    from[[i, j]] = x.0;
+                }
+            }
+        }
+
+        // Traceback through matrix.
+        let n = observations.len();
+        let mut result: Vec<usize> = Vec::new();
+        let mut curr = 0;
+        let mut res_prob = LogProb::ln_zero();
+        for (i, col) in vals.axis_iter(Axis(0)).rev().enumerate() {
+            if i == 0 {
+                let tmp = col.iter()
+                    .enumerate()
+                    .max_by_key(|&(_, item)| OrderedFloat(**item))
+                    .unwrap();
+                curr = tmp.0;
+                res_prob = *tmp.1;
+            } else {
+                curr = from[[n - i, curr]];
+            }
+            result.push(curr);
+        }
+        result.reverse();
+
+        (result, res_prob)
+    }
+
+    // Compute the probability of a series of observations using the forward algorithm.
+    pub fn forward(&self, observations: Vec<usize>) -> LogProb {
+        // The matrix with probabilities.
+        let mut vals = Array2::<LogProb>::zeros((observations.len(), self.num_states()));
+
+        // Compute matrix.
+        for (i, o) in observations.iter().enumerate() {
+            if i == 0 {
+                // Initial column.
+                for (j, p) in self.initial.iter().enumerate() {
+                    vals[[0, j]] = p + self.observation_prob(j, *o);
+                }
+            } else {
+                // Subsequent columns.
+                for j in 0..self.num_states() {
+                    let xs = (0..self.num_states())
+                        .map(|k| {
+                            vals[[i - 1, k]]
+                                + self.transition[[k, j]]
+                                + self.observation_prob(j, *o)
+                        })
+                        .collect::<Vec<LogProb>>();
+                    vals[[i, j]] = LogProb::ln_sum_exp(&xs);
+                }
+            }
+        }
+
+        // Compute final probability.
+        LogProb::ln_sum_exp(vals.row(observations.len() - 1).into_slice().unwrap())
+    }
+
+    // Compute the probability of a series of observations using the backward algorithm.
+    pub fn backward(&self, observations: Vec<usize>) -> LogProb {
+        // The matrix with probabilities.
+        let mut vals = Array2::<LogProb>::zeros((observations.len(), self.num_states()));
+
+        // Compute matrix.
+        for (i, o) in observations.iter().rev().enumerate() {
+            if i == 0 {
+                // Initial (last) column.
+                for j in 0..self.num_states() {
+                    vals[[0, j]] = LogProb::ln_one() + self.observation_prob(j, *o);
+                }
+            } else {
+                // Previous columns.
+                for j in 0..self.num_states() {
+                    let maybe_initial = if j == self.num_states() - 1 {
+                        self.initial[[j]]
+                    } else {
+                        LogProb::ln_one()
+                    };
+                    let xs = (0..self.num_states())
+                        .map(|k| {
+                            vals[[i - 1, k]]
+                                + self.transition[[j, k]]
+                                + self.observation_prob(j, *o)
+                                + maybe_initial
+                        })
+                        .collect::<Vec<LogProb>>();
+                    vals[[i, j]] = LogProb::ln_sum_exp(&xs);
+                }
+            }
+        }
+
+        // Compute final probability.
+        LogProb::ln_sum_exp(vals.row(observations.len() - 1).into_slice().unwrap())
+    }
+}
+
+/// Representation of univariate normal distribution.
+pub struct NormalDistParams {
+    pub mean: f64,
+    pub std_dev: f64,
+}
+
+/// A Hidden Markov Model with univariate continuous distribution for output.
+pub struct UnivariateGaussianHMM {
+    /// The state transition matrix (size `NxN`), `A` in Rabiner's tutorial.
+    transition: Array2<LogProb>,
+    /// The observation distributions for each of the `N` states.
+    observation: Vec<NormalDistParams>,
+    /// The initial state distribution
+    initial: Array1<LogProb>,
+}
+
+impl UnivariateGaussianHMM {
+    pub fn new(
+        transition: Array2<LogProb>,
+        observation: Vec<NormalDistParams>,
+        initial: Array1<LogProb>,
+    ) -> Result<Self, HMMError> {
+        let (an0, an1) = transition.dim();
+        let bn = observation.len();
+        let pin = initial.dim();
+
+        if an0 != an1 || an0 != bn || an0 != pin {
+            Err(HMMError::InvalidDimension(an0, an1, bn, 0, pin))
+        } else {
+            Ok(Self {
+                transition,
+                observation,
+                initial,
+            })
+        }
+    }
+
+    pub fn with_prob(
+        transition: &Array2<Prob>,
+        observation: Vec<NormalDistParams>,
+        initial: &Array1<Prob>,
+    ) -> Result<Self, HMMError> {
+        Self::new(
+            transition.map(|x| LogProb::from(*x)),
+            observation,
+            initial.map(|x| LogProb::from(*x)),
+        )
+    }
+
+    pub fn with_float(
+        transition: &Array2<f64>,
+        observation: Vec<NormalDistParams>,
+        initial: &Array1<f64>,
+    ) -> Result<Self, HMMError> {
+        Self::new(
+            transition.map(|x| LogProb::from(Prob(*x))),
+            observation,
+            initial.map(|x| LogProb::from(Prob(*x))),
+        )
+    }
+
+    pub fn num_states(&self) -> usize {
+        self.transition.dim().0
+    }
+
+    /// Return observation probabilitiy.
+    fn observation(&self, state: usize, obs: f64) -> LogProb {
+        let (mu, sigma) = self.observation(state, obs);
+        let x =
+            1.0 / (2 * f64::pi() * sigma).sqrt() * (-0.5 * (obs - mu) * (obs - mu) / (2.0 * sigma));
+        LogProb::from(Prob::from(x))
+    }
+
+    pub fn viterbi(&self, observations: Vec<f64>) -> (Vec<usize>, LogProb) {
+        // The matrix with probabilities.
+        let mut vals = Array2::<LogProb>::zeros((observations.len(), self.num_states()));
+        // For each cell in `vals`, a pointer to the row in the previous column (for the traceback).
+        let mut from = Array2::<usize>::zeros((observations.len(), self.num_states()));
+
+        // Compute matrix.
+        for (i, o) in observations.iter().enumerate() {
+            if i == 0 {
+                // Initial column.
+                for (j, p) in self.initial.iter().enumerate() {
+                    vals[[0, j]] = p + self.observation(j, *o);
                     from[[0, j]] = j;
                 }
             } else {
@@ -159,72 +370,6 @@ impl HMM {
         result.reverse();
 
         (result, res_prob)
-    }
-
-    // Compute the probability of a series of observations using the forward algorithm.
-    pub fn forward(&self, observations: Vec<usize>) -> LogProb {
-        // The matrix with probabilities.
-        let mut vals = Array2::<LogProb>::zeros((observations.len(), self.num_states()));
-
-        // Compute matrix.
-        for (i, o) in observations.iter().enumerate() {
-            if i == 0 {
-                // Initial column.
-                for (j, p) in self.initial.iter().enumerate() {
-                    vals[[0, j]] = p + self.observation[[j, *o]];
-                }
-            } else {
-                // Subsequent columns.
-                for j in 0..self.num_states() {
-                    let xs = (0..self.num_states())
-                        .map(|k| {
-                            vals[[i - 1, k]] + self.transition[[k, j]] + self.observation[[j, *o]]
-                        })
-                        .collect::<Vec<LogProb>>();
-                    vals[[i, j]] = LogProb::ln_sum_exp(&xs);
-                }
-            }
-        }
-
-        // Compute final probability.
-        LogProb::ln_sum_exp(vals.row(observations.len() - 1).into_slice().unwrap())
-    }
-
-    // Compute the probability of a series of observations using the backward algorithm.
-    pub fn backward(&self, observations: Vec<usize>) -> LogProb {
-        // The matrix with probabilities.
-        let mut vals = Array2::<LogProb>::zeros((observations.len(), self.num_states()));
-
-        // Compute matrix.
-        for (i, o) in observations.iter().rev().enumerate() {
-            if i == 0 {
-                // Initial (last) column.
-                for j in 0..self.num_states() {
-                    vals[[0, j]] = LogProb::ln_one() + self.observation[[j, *o]];
-                }
-            } else {
-                // Previous columns.
-                for j in 0..self.num_states() {
-                    let maybe_initial = if j == self.num_states() - 1 {
-                        self.initial[[j]]
-                    } else {
-                        LogProb::ln_one()
-                    };
-                    let xs = (0..self.num_states())
-                        .map(|k| {
-                            vals[[i - 1, k]]
-                                + self.transition[[j, k]]
-                                + self.observation[[j, *o]]
-                                + maybe_initial
-                        })
-                        .collect::<Vec<LogProb>>();
-                    vals[[i, j]] = LogProb::ln_sum_exp(&xs);
-                }
-            }
-        }
-
-        // Compute final probability.
-        LogProb::ln_sum_exp(vals.row(observations.len() - 1).into_slice().unwrap())
     }
 }
 
